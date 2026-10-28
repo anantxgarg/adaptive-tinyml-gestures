@@ -1,0 +1,200 @@
+"""Factory training: numpy MLP -> int8 backbone + float head -> firmware/model_data.h"""
+import os
+import numpy as np
+
+from data import BASE_CLASSES, factory_user, make_set
+from features import N_FEAT, extract_all
+
+H1, H2 = 32, 16
+MAX_CLASSES = 8
+N_EXEMPLARS = 4          # factory replay exemplars per class, kept in flash
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NPZ = os.path.join(ROOT, "python", "build", "model.npz")
+HEADER = os.path.join(ROOT, "firmware", "model_data.h")
+
+
+# ---------------------------------------------------------------- float training
+def relu(x):
+    return np.maximum(x, 0)
+
+
+def softmax(z):
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def init(rng, n_in, n_out):
+    return rng.normal(0, np.sqrt(2 / n_in), (n_out, n_in)).astype(np.float32), np.zeros(n_out, np.float32)
+
+
+def train_mlp(X, y, n_cls, rng, epochs=80, lr=3e-3, batch=64, wd=1e-4):
+    params = [*init(rng, N_FEAT, H1), *init(rng, H1, H2), *init(rng, H2, n_cls)]
+    m = [np.zeros_like(p) for p in params]
+    v = [np.zeros_like(p) for p in params]
+    Y = np.eye(n_cls)[y]
+    step = 0
+    for ep in range(epochs):
+        idx = rng.permutation(len(X))
+        for s in range(0, len(X), batch):
+            b = idx[s:s + batch]
+            x, t = X[b], Y[b]
+            W1, b1, W2, b2, W3, b3 = params
+            z1 = x @ W1.T + b1; a1 = relu(z1)
+            z2 = a1 @ W2.T + b2; a2 = relu(z2)
+            p = softmax(a2 @ W3.T + b3)
+            d3 = (p - t) / len(b)
+            d2 = (d3 @ W3) * (z2 > 0)
+            d1 = (d2 @ W2) * (z1 > 0)
+            grads = [d1.T @ x, d1.sum(0), d2.T @ a1, d2.sum(0), d3.T @ a2, d3.sum(0)]
+            step += 1
+            for i, g in enumerate(grads):
+                if i % 2 == 0:
+                    g = g + wd * params[i]
+                m[i] = 0.9 * m[i] + 0.1 * g
+                v[i] = 0.999 * v[i] + 0.001 * g * g
+                mh = m[i] / (1 - 0.9 ** step)
+                vh = v[i] / (1 - 0.999 ** step)
+                params[i] -= lr * mh / (np.sqrt(vh) + 1e-8)
+    return params
+
+
+# ---------------------------------------------------------------- int8 reference
+def round_half_away(v):
+    return np.where(v >= 0, np.floor(v + 0.5), np.ceil(v - 0.5))
+
+
+def q_embed(F, q):
+    """Bit-faithful Python model of the firmware's int8 backbone. Returns int8 embeddings."""
+    F = F.astype(np.float32)
+    xn = (F - q["feat_mean"]) * q["feat_inv_std"]
+    xq = np.clip(round_half_away(xn * q["in_inv_scale"]), -127, 127).astype(np.int32)
+    acc = xq @ q["w1"].astype(np.int32).T + q["b1"]
+    h1 = np.clip(np.floor(acc.astype(np.float32) * q["m1"] + 0.5), 0, 127).astype(np.int32)
+    acc = h1 @ q["w2"].astype(np.int32).T + q["b2"]
+    h2 = np.clip(np.floor(acc.astype(np.float32) * q["m2"] + 0.5), 0, 127)
+    return h2.astype(np.int8)
+
+
+def head_logits(E, q, W=None, b=None):
+    W = q["head_w"] if W is None else W
+    b = q["head_b"] if b is None else b
+    return (E.astype(np.float32) * q["emb_scale"]) @ W.T + b
+
+
+def quantize(params, Xn):
+    W1, b1, W2, b2, W3, b3 = params
+    s_in = np.percentile(np.abs(Xn), 99.9) / 127
+    a1 = relu(Xn @ W1.T + b1)
+    a2 = relu(a1 @ W2.T + b2)
+    s_h1 = np.percentile(a1, 99.9) / 127
+    s_h2 = np.percentile(a2, 99.9) / 127
+    sw1 = np.abs(W1).max() / 127
+    sw2 = np.abs(W2).max() / 127
+    return dict(
+        in_inv_scale=np.float32(1 / s_in),
+        w1=np.round(W1 / sw1).astype(np.int8),
+        b1=np.round(b1 / (sw1 * s_in)).astype(np.int32),
+        m1=np.float32(sw1 * s_in / s_h1),
+        w2=np.round(W2 / sw2).astype(np.int8),
+        b2=np.round(b2 / (sw2 * s_h1)).astype(np.int32),
+        m2=np.float32(sw2 * s_h1 / s_h2),
+        emb_scale=np.float32(s_h2),
+        head_w=W3.astype(np.float32),
+        head_b=b3.astype(np.float32),
+    )
+
+
+def refit_head(E, y, q, epochs=300, lr=0.1):
+    """Re-tune the float head on *quantized* embeddings (recovers quantization loss)."""
+    W, b = q["head_w"].copy(), q["head_b"].copy()
+    Y = np.eye(W.shape[0])[y]
+    e = E.astype(np.float32) * q["emb_scale"]
+    for _ in range(epochs):
+        p = softmax(e @ W.T + b)
+        d = (p - Y) / len(e)
+        W -= lr * (d.T @ e)
+        b -= lr * d.sum(0)
+    q["head_w"], q["head_b"] = W.astype(np.float32), b.astype(np.float32)
+
+
+# ---------------------------------------------------------------- export
+def c_array(ctype, name, a):
+    a = np.asarray(a)
+    fmt = (lambda v: f"{v:.8e}f") if ctype == "float" else (lambda v: str(int(v)))
+
+    def init(x, depth):
+        if x.ndim == 1:
+            return "{" + ", ".join(fmt(v) for v in x) + "}"
+        sep = ",\n" + "    " * (depth + 1)
+        return "{\n" + "    " * (depth + 1) + sep.join(init(r, depth + 1) for r in x) \
+            + "\n" + "    " * depth + "}"
+
+    dims = "".join(f"[{d}]" for d in a.shape)
+    return f"static const {ctype} {name}{dims} = {init(a, 0)};\n"
+
+
+def export_header(q, n_base):
+    out = ["/* Generated by python/train.py - do not edit. */",
+           "#ifndef MODEL_DATA_H", "#define MODEL_DATA_H", "#include <stdint.h>", "",
+           f"#define TML_H1 {H1}", f"#define TML_H2 {H2}",
+           f"#define TML_N_BASE_CLASSES {n_base}", f"#define TML_MAX_CLASSES {MAX_CLASSES}",
+           f"#define TML_N_EXEMPLARS {N_EXEMPLARS}",
+           f"#define TML_IN_INV_SCALE {q['in_inv_scale']:.8e}f",
+           f"#define TML_M1 {q['m1']:.8e}f", f"#define TML_M2 {q['m2']:.8e}f",
+           f"#define TML_EMB_SCALE {q['emb_scale']:.8e}f", ""]
+    out.append(c_array("float", "tml_feat_mean", q["feat_mean"]))
+    out.append(c_array("float", "tml_feat_inv_std", q["feat_inv_std"]))
+    out.append(c_array("int8_t", "tml_w1", q["w1"]))
+    out.append(c_array("int32_t", "tml_b1", q["b1"]))
+    out.append(c_array("int8_t", "tml_w2", q["w2"]))
+    out.append(c_array("int32_t", "tml_b2", q["b2"]))
+    out.append(c_array("float", "tml_head_w0", q["head_w"]))
+    out.append(c_array("float", "tml_head_b0", q["head_b"]))
+    out.append(c_array("int8_t", "tml_exemplars", q["exemplars"]))
+    out.append("#endif")
+    with open(HEADER, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+
+
+def main():
+    rng = np.random.default_rng(0)
+    users = [factory_user(rng) for _ in range(24)]
+    X, y = make_set(users[:20], BASE_CLASSES, 40, rng)
+    Xv, yv = make_set(users[20:], BASE_CLASSES, 40, rng)
+    F, Fv = extract_all(X), extract_all(Xv)
+
+    mean, std = F.mean(0), F.std(0) + 1e-6
+    Fn, Fvn = (F - mean) / std, (Fv - mean) / std
+    params = train_mlp(Fn, y, len(BASE_CLASSES), rng)
+
+    W1, b1, W2, b2, W3, b3 = params
+    fp = (relu(relu(Fvn @ W1.T + b1) @ W2.T + b2) @ W3.T + b3).argmax(1)
+    print(f"float32 model   val acc (unseen factory users): {(fp == yv).mean():.3f}")
+
+    q = quantize(params, Fn)
+    q["feat_mean"] = mean.astype(np.float32)
+    q["feat_inv_std"] = (1 / std).astype(np.float32)
+    E = q_embed(F, q)
+    refit_head(E, y, q)
+    qp = head_logits(q_embed(Fv, q), q).argmax(1)
+    print(f"int8 backbone   val acc (unseen factory users): {(qp == yv).mean():.3f}")
+
+    # factory exemplars for the on-device replay buffer: correctly classified, random
+    pred = head_logits(E, q).argmax(1)
+    ex = []
+    for c in range(len(BASE_CLASSES)):
+        ok = np.flatnonzero((y == c) & (pred == c))
+        ex.append(E[rng.choice(ok, N_EXEMPLARS, replace=False)])
+    q["exemplars"] = np.stack(ex)
+
+    os.makedirs(os.path.dirname(NPZ), exist_ok=True)
+    np.savez(NPZ, **q)
+    export_header(q, len(BASE_CLASSES))
+    flash = q["w1"].size + q["w2"].size + 4 * (q["b1"].size + q["b2"].size) \
+        + 4 * (q["head_w"].size + q["head_b"].size + 2 * N_FEAT) + q["exemplars"].size
+    print(f"exported {HEADER}  (model constants: {flash} bytes)")
+
+
+if __name__ == "__main__":
+    main()
